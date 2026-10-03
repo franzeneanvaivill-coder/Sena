@@ -8,8 +8,12 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import java.text.SimpleDateFormat
@@ -17,7 +21,9 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
@@ -29,7 +35,7 @@ class SenaService : Service() {
         const val ACTION_STOP = "com.sena.app.STOP_SERVICE"
         private const val CH = "sena_listen"
         private const val NOTIF = 1
-        private const val ACTIVE_WINDOW_MS = 20_000L
+        private const val ACTIVE_WINDOW_MS = 45_000L
 
         @Volatile
         var running = false
@@ -47,6 +53,7 @@ class SenaService : Service() {
     @Volatile
     private var speakLatch: CountDownLatch? = null
     private val history = ArrayList<Pair<String, String>>()
+    private val pool = Executors.newFixedThreadPool(3)
     private var lastReplyAt = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -89,6 +96,7 @@ class SenaService : Service() {
         stopping = true
         running = false
         speakLatch?.countDown()
+        pool.shutdownNow()
         try { tts?.stop(); tts?.shutdown() } catch (_: Exception) {}
         tts = null
         SenaLog.add("Stopped.")
@@ -196,10 +204,10 @@ class SenaService : Service() {
         applyIntent(res)
         val reply = res.reply.trim()
         if (reply.isEmpty()) return
-        SenaLog.add("Sena: $reply")
+        SenaLog.add("Sena: ${plain(reply)}")
 
-        history.add(res.heard to reply)
-        while (history.size > 6) history.removeAt(0)
+        history.add(res.heard to plain(reply))
+        while (history.size > 10) history.removeAt(0)
         speak(reply, res.lang)
         lastReplyAt = System.currentTimeMillis()
     }
@@ -231,7 +239,7 @@ class SenaService : Service() {
 
     private fun buildContext(active: Boolean): String {
         val now = System.currentTimeMillis()
-        if (now - lastReplyAt > 300_000L) history.clear()
+        if (now - lastReplyAt > 600_000L) history.clear()
         val sb = StringBuilder()
         sb.append("Current local time: ")
             .append(SimpleDateFormat("EEEE, MMMM d, yyyy, h:mm a", Locale.US).format(Date(now)))
@@ -246,19 +254,85 @@ class SenaService : Service() {
         return sb.toString()
     }
 
+    /** Removes voice tags such as <short pause> so they are never read aloud or shown. */
+    private fun plain(s: String): String =
+        s.replace(Regex("<[^>]{1,20}>"), "").replace(Regex("\\s+"), " ").trim()
+
+    private fun chunks(text: String): List<String> {
+        val s = text.split(Regex("(?<=[.!?])\\s+")).filter { it.isNotBlank() }
+        return if (s.size <= 3) s else listOf(s[0], s[1], s.drop(2).joinToString(" "))
+    }
+
+    /** Natural voice from Gemini; falls back to the phone's own voice if anything goes wrong. */
     private fun speak(text: String, lang: String) {
+        val key = Store.apiKey(this)
+        val parts = chunks(text)
+        // Fetch all sentences in parallel, play them in order: the first one starts sooner.
+        val futures = parts.map { part ->
+            pool.submit(Callable<ByteArray?> {
+                try {
+                    Gemini.speech(key, part)
+                } catch (e: Exception) {
+                    SenaLog.add("Voice error: ${e.message}")
+                    null
+                }
+            })
+        }
+        for ((i, f) in futures.withIndex()) {
+            val pcm = try { f.get(40, TimeUnit.SECONDS) } catch (e: Exception) { null }
+            if (stopping) return
+            if (pcm == null || pcm.size < 2) {
+                speakPhone(plain(parts.drop(i).joinToString(" ")), lang)
+                break
+            }
+            play(pcm)
+        }
+        try { Thread.sleep(300) } catch (_: InterruptedException) {}
+    }
+
+    private fun play(pcm: ByteArray) {
+        val frames = pcm.size / 2
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setSampleRate(Gemini.TTS_RATE)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build()
+            )
+            .setBufferSizeInBytes(pcm.size)
+            .setTransferMode(AudioTrack.MODE_STATIC)
+            .build()
+        try {
+            track.write(pcm, 0, pcm.size)
+            track.play()
+            val end = SystemClock.elapsedRealtime() + frames * 1000L / Gemini.TTS_RATE + 1500L
+            while (!stopping && track.playbackHeadPosition < frames && SystemClock.elapsedRealtime() < end) {
+                Thread.sleep(40)
+            }
+        } finally {
+            track.release()
+        }
+    }
+
+    private fun speakPhone(text: String, lang: String) {
         val t = tts ?: return
         if (!ttsReady || text.isBlank()) return
         val tag = lang.ifBlank { Store.lang(this) }
         val r = t.setLanguage(Locale.forLanguageTag(tag))
         if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
-            SenaLog.add("No voice installed for $tag, using the default.")
+            SenaLog.add("No phone voice installed for $tag, using the default.")
             t.setLanguage(Locale.getDefault())
         }
         val latch = CountDownLatch(1)
         speakLatch = latch
         t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "sena")
         latch.await(30, TimeUnit.SECONDS)
-        try { Thread.sleep(300) } catch (_: InterruptedException) {}
     }
 }

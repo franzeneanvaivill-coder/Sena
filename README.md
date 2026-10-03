@@ -31,3 +31,15 @@ open the Actions tab, run "Build APK", and download the Sena-apk artifact. The f
 - She cannot be interrupted while thinking or speaking.
 - Alarms are lost if the phone restarts. Music is not included yet.
 - Some phone brands kill background apps; if she stops listening, look for the brand's battery or auto-start settings.
+
+## Stage 3 update: a natural, mature voice
+- Sena now speaks with Gemini's speech voice **Gacrux** (labelled "Mature"), not the phone's robotic voice.
+  If the voice service fails or is rate-limited, she falls back to the phone's own voice automatically.
+- To change the voice, open `app/src/main/java/com/sena/app/Gemini.kt` and change the word after `const val VOICE =`.
+  Other good options: Sulafat (warm), Vindemiatrix (gentle), Schedar (even), Achernar (soft).
+  Listen to them first at aistudio.google.com/generate-speech.
+- More human conversation: she keeps listening for 45 seconds after each reply (no need to repeat "Sena" while you
+  are chatting), remembers the last 10 exchanges, and talks in short, natural phone-call sentences. Long replies are
+  spoken sentence by sentence so she starts talking sooner.
+- The voice service counts against your Gemini quota. If her voice suddenly goes robotic, the Activity log will show a "Voice error" line.
+- Still not possible: interrupting her while she talks.
