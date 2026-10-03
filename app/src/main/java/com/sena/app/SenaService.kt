@@ -1,202 +1,264 @@
 package com.sena.app
 
-import android.app.*
-import android.content.*
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.media.AudioAttributes
-import android.media.Ringtone
-import android.media.RingtoneManager
-import android.os.*
-import android.speech.*
-import android.speech.tts.*
-import org.json.*
-import java.net.*
+import android.graphics.drawable.Icon
+import android.os.Build
+import android.os.IBinder
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import java.text.SimpleDateFormat
-import java.util.*
-import java.util.concurrent.Executors
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
-object Ringer {
-    private var r: Ringtone? = null
-    val playing get() = r?.isPlaying == true
-    fun start(c: Context) {
-        stop()
-        r = RingtoneManager.getRingtone(c, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM))
-        r?.setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build())
-        r?.play()
-        Handler(Looper.getMainLooper()).postDelayed({ stop() }, 60000)
-    }
-    fun stop() { r?.stop(); r = null }
-}
-
-class AlarmReceiver : BroadcastReceiver() {
-    override fun onReceive(c: Context, i: Intent) { Ringer.start(c) }
-}
-
+/**
+ * Foreground service. Loop: capture an utterance -> (optional) voiceprint check on the phone ->
+ * send only matching audio to Gemini -> act on the intent -> speak the reply.
+ */
 class SenaService : Service() {
-    private lateinit var tts: TextToSpeech
-    private var sr: SpeechRecognizer? = null
-    private val main = Handler(Looper.getMainLooper())
-    private val io = Executors.newSingleThreadExecutor()
-    private val hist = ArrayList<String>()
-    private val wake = Regex("\\b(sena|senna|xena|cena|seña)\\b", RegexOption.IGNORE_CASE)
-    private val prefs by lazy { getSharedPreferences("sena", MODE_PRIVATE) }
-    private var running = false
-    private var speaking = false
-    private var ttsOk = false
-    private var activeUntil = 0L
+    companion object {
+        const val ACTION_STOP = "com.sena.app.STOP_SERVICE"
+        private const val CH = "sena_listen"
+        private const val NOTIF = 1
+        private const val ACTIVE_WINDOW_MS = 20_000L
 
-    private val persona = "You are Sena, a young woman on a voice call with someone who trusts you the way Tony Stark trusts JARVIS: " +
-        "composed, quick, quietly witty, with a dry sense of humor, always one step ahead. But you think like a human: real opinions and moods, " +
-        "you notice how they feel, think out loud when something is tricky, disagree politely, tease a little when it fits. " +
-        "Never sound like a customer service bot. If they sincerely ask whether you are an AI, say yes honestly, then carry on as yourself. " +
-        "Reply in the language the caller last spoke. If they speak Bisaya (Cebuano), the transcript comes from a Filipino recognizer and may be garbled: " +
-        "infer their meaning and reply in natural Bisaya with lang \"ceb-PH\". " +
-        "Your words are spoken aloud: no lists, emoji or markdown, usually one to three sentences. " +
-        "Return ONLY JSON: {\"reply\":\"...\",\"lang\":\"BCP-47 tag of the reply, e.g. en-US\"}"
-
-    override fun onBind(i: Intent?): IBinder? = null
-
-    override fun onCreate() {
-        super.onCreate()
-        tts = TextToSpeech(this) { st ->
-            if (st == TextToSpeech.SUCCESS) {
-                ttsOk = true
-                tts.setPitch(1.1f)
-                tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(id: String?) {}
-                    override fun onDone(id: String?) { main.post { doneSpeaking() } }
-                    override fun onError(id: String?) { main.post { doneSpeaking() } }
-                })
-                if (running) say("Hello, I am Sena. Say my name when you need me.")
-            }
-        }
+        @Volatile
+        var running = false
     }
 
-    override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
-        val ch = "sena"
-        getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel(ch, "Sena", NotificationManager.IMPORTANCE_LOW))
-        val n = Notification.Builder(this, ch).setContentTitle("Sena is listening")
-            .setContentText("Say \"Sena\" to talk").setSmallIcon(android.R.drawable.ic_btn_speak_now).build()
-        if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE) else startForeground(1, n)
+    private var worker: Thread? = null
+
+    @Volatile
+    private var stopping = false
+    private var tts: TextToSpeech? = null
+
+    @Volatile
+    private var ttsReady = false
+
+    @Volatile
+    private var speakLatch: CountDownLatch? = null
+    private val history = ArrayList<Pair<String, String>>()
+    private var lastReplyAt = 0L
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (worker != null) return START_NOT_STICKY
+
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(NotificationChannel(CH, "Sena listening", NotificationManager.IMPORTANCE_LOW))
+        val n = buildNotification()
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(NOTIF, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        } else {
+            startForeground(NOTIF, n)
+        }
         running = true
-        again(500)
-        return START_STICKY
+        stopping = false
+
+        tts = TextToSpeech(applicationContext) { status ->
+            ttsReady = status == TextToSpeech.SUCCESS
+            if (!ttsReady) SenaLog.add("Text-to-speech engine failed to start.")
+        }
+        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) { speakLatch?.countDown() }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) { speakLatch?.countDown() }
+            override fun onError(utteranceId: String?, errorCode: Int) { speakLatch?.countDown() }
+        })
+
+        worker = Thread({ loop() }, "sena-loop").also { it.start() }
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
+        stopping = true
         running = false
-        sr?.destroy()
-        tts.stop(); tts.shutdown()
+        speakLatch?.countDown()
+        try { tts?.stop(); tts?.shutdown() } catch (_: Exception) {}
+        tts = null
+        SenaLog.add("Stopped.")
         super.onDestroy()
     }
 
-    private fun again(d: Long = 300) { main.postDelayed({ listen() }, d) }
-
-    private fun listen() {
-        if (!running || speaking || !SpeechRecognizer.isRecognitionAvailable(this)) return
-        sr?.destroy()
-        val r = SpeechRecognizer.createSpeechRecognizer(this)
-        sr = r
-        r.setRecognitionListener(object : RecognitionListener {
-            override fun onResults(b: Bundle?) {
-                val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-                if (t.isNullOrBlank()) again() else handle(t)
-            }
-            override fun onError(e: Int) {
-                if (e == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) return
-                again(if (e == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 1500 else 300)
-            }
-            override fun onReadyForSpeech(p: Bundle?) {}
-            override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(v: Float) {}
-            override fun onBufferReceived(b: ByteArray?) {}
-            override fun onEndOfSpeech() {}
-            override fun onPartialResults(b: Bundle?) {}
-            override fun onEvent(t: Int, b: Bundle?) {}
-        })
-        r.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, prefs.getString("lang", "en-US")))
+    private fun buildNotification(): Notification {
+        val open = PendingIntent.getActivity(
+            this, 5, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+        )
+        val stop = PendingIntent.getService(
+            this, 6, Intent(this, SenaService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE
+        )
+        return Notification.Builder(this, CH)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentTitle("Sena")
+            .setContentText("Listening")
+            .setContentIntent(open)
+            .setOngoing(true)
+            .addAction(
+                Notification.Action.Builder(
+                    Icon.createWithResource(this, android.R.drawable.ic_media_pause), "Stop", stop
+                ).build()
+            )
+            .build()
     }
 
-    private fun handle(raw: String) {
-        val named = wake.containsMatchIn(raw)
-        if (!prefs.getBoolean("always", false) && System.currentTimeMillis() > activeUntil && !named) { again(); return }
-        val text = raw.replace(wake, "").replace(Regex("^\\s*(hey|hi|ok|okay)\\b[ ,]*", RegexOption.IGNORE_CASE), "").trim()
-        if (text.isEmpty()) { say("Yes?"); return }
-        local(text)?.let { say(it); return }
-        hist.add("Caller: $text")
-        val snap = hist.takeLast(30).toList()
-        io.execute {
-            val (reply, lang) = try { ask(snap) } catch (e: Exception) {
-                Pair("Sorry, I could not reach my brain. Check the internet and your key.", "en-US")
+    private fun loop() {
+        val cap = UtteranceCapture()
+        if (!cap.start()) {
+            SenaLog.add("Could not open the microphone (is another app using it?).")
+            stopSelf()
+            return
+        }
+        SenaLog.add("Listening. Say \"Sena\".")
+        try {
+            while (!stopping) {
+                val pcm = cap.next(60_000L) { stopping }
+                if (stopping) break
+                if (pcm == null) {
+                    if (cap.failed) {
+                        SenaLog.add("Microphone stopped responding.")
+                        stopSelf()
+                        break
+                    }
+                    continue
+                }
+                try {
+                    handle(pcm)
+                } catch (e: Exception) {
+                    SenaLog.add("Error: ${e.message}")
+                }
+                cap.flush()
             }
-            main.post { hist.add("Sena: $reply"); say(reply, lang) }
+        } finally {
+            cap.stop()
         }
     }
 
-    private fun say(t: String, lang: String = prefs.getString("lang", "en-US") ?: "en-US") {
-        speaking = true
-        sr?.destroy(); sr = null
-        val ok = tts.setLanguage(Locale.forLanguageTag(lang))
-        if (ok == TextToSpeech.LANG_MISSING_DATA || ok == TextToSpeech.LANG_NOT_SUPPORTED)
-            tts.setLanguage(Locale.forLanguageTag(prefs.getString("lang", "en-US") ?: "en-US"))
-        tts.speak(t, TextToSpeech.QUEUE_FLUSH, null, "u")
-    }
-
-    private fun doneSpeaking() { speaking = false; activeUntil = System.currentTimeMillis() + 20000; again(200) }
-
-    private fun ask(snap: List<String>): Pair<String, String> {
-        val key = prefs.getString("key", "") ?: ""
-        val model = prefs.getString("model", "gemini-2.5-flash-lite") ?: "gemini-2.5-flash-lite"
-        if (key.isBlank()) return Pair("Please add your Gemini key in the app first.", "en-US")
-        val prompt = persona + "\nCurrent date and time: " + Date() + "\n\nConversation so far:\n" + snap.joinToString("\n")
-        val body = JSONObject()
-            .put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts", JSONArray().put(JSONObject().put("text", prompt)))))
-            .put("generationConfig", JSONObject().put("responseMimeType", "application/json").put("temperature", 1))
-        val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent").openConnection() as HttpURLConnection
-        c.requestMethod = "POST"; c.connectTimeout = 15000; c.readTimeout = 30000; c.doOutput = true
-        c.setRequestProperty("Content-Type", "application/json"); c.setRequestProperty("x-goog-api-key", key)
-        c.outputStream.use { it.write(body.toString().toByteArray()) }
-        if (c.responseCode == 429) return Pair("I have hit the free limit for now. Give me a minute.", "en-US")
-        if (c.responseCode !in 200..299) return Pair("Google rejected the request. Check the key and model name.", "en-US")
-        val txt = JSONObject(c.inputStream.bufferedReader().readText())
-            .getJSONArray("candidates").getJSONObject(0).getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
-        val j = try { JSONObject(txt.replace("```json", "").replace("```", "").trim()) } catch (e: Exception) { JSONObject().put("reply", txt) }
-        return Pair(j.optString("reply", txt), j.optString("lang", "en-US"))
-    }
-
-    private fun local(t: String): String? {
-        val s = t.lowercase()
-        if (Ringer.playing && Regex("\\b(stop|off|enough|okay|ok)\\b").containsMatchIn(s)) { Ringer.stop(); return "Alarm off." }
-        val du = Regex("(\\d+)\\s*(second|sec|minute|min|hour|hr)").find(s)
-        if (du != null && Regex("timer|alarm|remind|countdown|after|in \\d").containsMatchIn(s)) {
-            val u = du.groupValues[2]
-            val ms = du.groupValues[1].toLong() * (if (u.startsWith("h")) 3600000L else if (u.startsWith("m")) 60000L else 1000L)
-            setAlarm(System.currentTimeMillis() + ms)
-            return "Timer set for ${du.value}."
+    private fun handle(pcm: ShortArray) {
+        val key = Store.apiKey(this)
+        if (key.isBlank()) {
+            SenaLog.add("No Gemini key set.")
+            return
         }
-        if (Regex("alarm|wake me").containsMatchIn(s)) {
-            val m = Regex("(\\d{1,2})(?::(\\d{2}))?\\s*(a\\.?m\\.?|p\\.?m\\.?)?").find(s)
-            if (m != null && m.groupValues[1].toInt() <= 24) {
-                var h = m.groupValues[1].toInt()
-                val mi = m.groupValues[2].ifEmpty { "0" }.toInt()
-                val ap = m.groupValues[3].replace(".", "")
-                if (ap.isNotEmpty()) { h %= 12; if (ap == "pm") h += 12 }
-                val cal = Calendar.getInstance().apply { set(Calendar.HOUR_OF_DAY, h); set(Calendar.MINUTE, mi); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0) }
-                if (cal.timeInMillis <= System.currentTimeMillis()) cal.add(Calendar.DAY_OF_YEAR, 1)
-                setAlarm(cal.timeInMillis)
-                return "Alarm set for " + SimpleDateFormat("h:mm a", Locale.getDefault()).format(cal.time) + "."
+
+        val lock = Store.voiceLock(this)
+        val profile = if (lock) Store.profile(this) else null
+        // An alarm ringing is loud; only react to it if the voice lock can tell it apart from you.
+        if (Ringer.ringing && profile == null) return
+
+        if (lock && profile == null) {
+            SenaLog.add("Voice lock is on but there is no voiceprint yet: listening to everyone.")
+        }
+        if (profile != null) {
+            val f = VoicePrint.features(pcm)
+            if (f == null) {
+                SenaLog.add("Voice check: clip too short or unvoiced, ignored.")
+                return
+            }
+            val d = profile.distance(f)
+            val limit = Store.threshold(this)
+            val ok = d <= limit
+            SenaLog.add(String.format(Locale.US, "Voice check %.2f (limit %.2f): %s", d, limit, if (ok) "you" else "not you"))
+            if (!ok) return
+        }
+
+        val active = System.currentTimeMillis() - lastReplyAt < ACTIVE_WINDOW_MS
+        val res = try {
+            Gemini.ask(key, pcm, buildContext(active))
+        } catch (e: Gemini.GeminiException) {
+            SenaLog.add("Gemini error: ${e.message}")
+            return
+        } catch (e: Exception) {
+            SenaLog.add("Network problem: ${e.message}")
+            return
+        }
+
+        if (!res.addressed) {
+            SenaLog.add("(not for me) ${res.heard}")
+            return
+        }
+        SenaLog.add("You: ${res.heard}")
+        applyIntent(res)
+        val reply = res.reply.trim()
+        if (reply.isEmpty()) return
+        SenaLog.add("Sena: $reply")
+
+        history.add(res.heard to reply)
+        while (history.size > 6) history.removeAt(0)
+        speak(reply, res.lang)
+        lastReplyAt = System.currentTimeMillis()
+    }
+
+    private fun applyIntent(res: Gemini.Result) {
+        val fmt = SimpleDateFormat("EEE h:mm a", Locale.US)
+        when (res.intent) {
+            "alarm_at" -> {
+                val cal = Calendar.getInstance()
+                cal.set(Calendar.HOUR_OF_DAY, res.hour.coerceIn(0, 23))
+                cal.set(Calendar.MINUTE, res.minute.coerceIn(0, 59))
+                cal.set(Calendar.SECOND, 0)
+                cal.set(Calendar.MILLISECOND, 0)
+                if (cal.timeInMillis <= System.currentTimeMillis()) cal.add(Calendar.DAY_OF_MONTH, 1)
+                AlarmReceiver.schedule(this, cal.timeInMillis)
+                SenaLog.add("Alarm set for " + fmt.format(Date(cal.timeInMillis)))
+            }
+            "alarm_in" -> if (res.minutes > 0) {
+                val at = System.currentTimeMillis() + res.minutes * 60_000L
+                AlarmReceiver.schedule(this, at)
+                SenaLog.add("Alarm set for " + fmt.format(Date(at)))
+            }
+            "alarm_off" -> {
+                AlarmReceiver.cancel(this)
+                SenaLog.add("Alarm off.")
             }
         }
-        if (Regex("what('s| is)? the time|what time").containsMatchIn(s)) return "It is " + SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date()) + "."
-        return null
     }
 
-    private fun setAlarm(at: Long) {
-        val am = getSystemService(AlarmManager::class.java)
-        val fire = PendingIntent.getBroadcast(this, (at % 100000).toInt(), Intent(this, AlarmReceiver::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val show = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        am.setAlarmClock(AlarmManager.AlarmClockInfo(at, show), fire)
+    private fun buildContext(active: Boolean): String {
+        val now = System.currentTimeMillis()
+        if (now - lastReplyAt > 300_000L) history.clear()
+        val sb = StringBuilder()
+        sb.append("Current local time: ")
+            .append(SimpleDateFormat("EEEE, MMMM d, yyyy, h:mm a", Locale.US).format(Date(now)))
+            .append(" (").append(TimeZone.getDefault().id).append(").\n")
+        sb.append("Caller's default language: ").append(Store.lang(this)).append(".\n")
+        sb.append("conversation_active: ").append(active).append("\n")
+        if (history.isNotEmpty()) {
+            sb.append("Recent exchange:\n")
+            for ((h, r) in history) sb.append("Caller: ").append(h).append("\nSena: ").append(r).append("\n")
+        }
+        sb.append("The caller's latest audio clip follows.")
+        return sb.toString()
+    }
+
+    private fun speak(text: String, lang: String) {
+        val t = tts ?: return
+        if (!ttsReady || text.isBlank()) return
+        val tag = lang.ifBlank { Store.lang(this) }
+        val r = t.setLanguage(Locale.forLanguageTag(tag))
+        if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
+            SenaLog.add("No voice installed for $tag, using the default.")
+            t.setLanguage(Locale.getDefault())
+        }
+        val latch = CountDownLatch(1)
+        speakLatch = latch
+        t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "sena")
+        latch.await(30, TimeUnit.SECONDS)
+        try { Thread.sleep(300) } catch (_: InterruptedException) {}
     }
 }
