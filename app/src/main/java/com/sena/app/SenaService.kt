@@ -16,6 +16,7 @@ import android.os.IBinder
 import android.os.SystemClock
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -39,6 +40,14 @@ class SenaService : Service() {
 
         @Volatile
         var running = false
+
+        /** Asleep until the caller says "Sena, activate". Every answer then needs her name. */
+        @Volatile
+        var awake = true
+
+        private val NAME_RE = Regex("\\b(sena|senna|seena|sina|sinna|partner|pardner)\\b")
+        private val WAKE_RE = Regex("(?<!de)activat|aktibat|aktibar|wake up|gising")
+        private val SLEEP_RE = Regex("deactivat|go to sleep|sleep mode|stand ?by|matulog na")
     }
 
     private var worker: Thread? = null
@@ -54,6 +63,11 @@ class SenaService : Service() {
     private var speakLatch: CountDownLatch? = null
     private val history = ArrayList<Pair<String, String>>()
     private val pool = Executors.newFixedThreadPool(3)
+    private var live: LiveSession? = null
+
+    @Volatile
+    private var pendingSleep = false
+    private var player: LivePlayer? = null
     private var lastReplyAt = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -75,6 +89,8 @@ class SenaService : Service() {
         }
         running = true
         stopping = false
+        awake = !Store.startAsleep(this)
+        SenaLog.add(if (awake) "Awake. Say \"Sena\" or \"Partner\" before each question." else "Asleep. Say \"Sena, activate\" to wake me.")
 
         tts = TextToSpeech(applicationContext) { status ->
             ttsReady = status == TextToSpeech.SUCCESS
@@ -88,6 +104,7 @@ class SenaService : Service() {
             override fun onError(utteranceId: String?, errorCode: Int) { speakLatch?.countDown() }
         })
 
+        if (Store.liveMode(this)) startLive()
         worker = Thread({ loop() }, "sena-loop").also { it.start() }
         return START_NOT_STICKY
     }
@@ -97,6 +114,10 @@ class SenaService : Service() {
         running = false
         speakLatch?.countDown()
         pool.shutdownNow()
+        try { live?.close() } catch (_: Exception) {}
+        live = null
+        try { player?.release() } catch (_: Exception) {}
+        player = null
         try { tts?.stop(); tts?.shutdown() } catch (_: Exception) {}
         tts = null
         SenaLog.add("Stopped.")
@@ -150,7 +171,7 @@ class SenaService : Service() {
                 } catch (e: Exception) {
                     SenaLog.add("Error: ${e.message}")
                 }
-                cap.flush()
+                if (live?.ready != true) cap.flush()
             }
         } finally {
             cap.stop()
@@ -163,6 +184,11 @@ class SenaService : Service() {
             SenaLog.add("No Gemini key set.")
             return
         }
+
+        val lv = live
+        val liveReady = lv != null && lv.ready
+        // She is still talking: do not treat her own voice (or an interruption) as a new question.
+        if (liveReady && player?.isBusy() == true) return
 
         val lock = Store.voiceLock(this)
         val profile = if (lock) Store.profile(this) else null
@@ -185,9 +211,14 @@ class SenaService : Service() {
             if (!ok) return
         }
 
+        if (liveReady && lv != null) {
+            if (lv.sendUtterance(pcm)) return
+            SenaLog.add("Instant mode could not send; using the classic path.")
+        }
+
         val active = System.currentTimeMillis() - lastReplyAt < ACTIVE_WINDOW_MS
         val res = try {
-            Gemini.ask(key, pcm, buildContext(active))
+            Gemini.ask(key, pcm, buildContext(active), Store.smartBrain(this), Store.webSearch(this))
         } catch (e: Gemini.GeminiException) {
             SenaLog.add("Gemini error: ${e.message}")
             return
@@ -196,11 +227,38 @@ class SenaService : Service() {
             return
         }
 
-        if (!res.addressed) {
+        val said = res.heard.lowercase()
+        val named = NAME_RE.containsMatchIn(said)
+        if (!awake) {
+            if (named && WAKE_RE.containsMatchIn(said)) {
+                awake = true
+                SenaLog.add("You: ${res.heard}")
+                SenaLog.add("Awake.")
+                speak(
+                    if (res.lang.startsWith("ceb")) "Gising na ko. Unsa'y akong matabang?" else "I'm awake. What do you need?",
+                    res.lang
+                )
+            } else {
+                SenaLog.add("(asleep) ${res.heard}")
+            }
+            return
+        }
+        if (!named) {
+            SenaLog.add("(no name, ignored) ${res.heard}")
+            return
+        }
+        if (SLEEP_RE.containsMatchIn(said)) {
+            SenaLog.add("You: ${res.heard}")
+            speak(if (res.lang.startsWith("ceb")) "Sige, matulog na ko." else "Going to sleep.", res.lang)
+            awake = false
+            SenaLog.add("Asleep. Say \"Sena, activate\" to wake me.")
+            return
+        }
+        if (!res.addressed && !named) {
             SenaLog.add("(not for me) ${res.heard}")
             return
         }
-        SenaLog.add("You: ${res.heard}")
+        SenaLog.add("You: ${res.heard}" + if (res.confident) "" else "  (not sure I heard that right)")
         applyIntent(res)
         val reply = res.reply.trim()
         if (reply.isEmpty()) return
@@ -210,6 +268,82 @@ class SenaService : Service() {
         while (history.size > 10) history.removeAt(0)
         speak(reply, res.lang)
         lastReplyAt = System.currentTimeMillis()
+    }
+
+    private fun startLive() {
+        val key = Store.apiKey(this)
+        if (key.isBlank()) return
+        val p = LivePlayer()
+        p.start()
+        player = p
+        live = LiveSession(key, object : LiveEvents {
+            override fun onLog(msg: String) { SenaLog.add(msg) }
+            override fun onAudio(pcm24k: ByteArray) { if (awake) p.enqueue(pcm24k) }
+            override fun isAwake(): Boolean = awake
+            override fun onTurnComplete() {
+                if (pendingSleep) {
+                    pendingSleep = false
+                    awake = false
+                    SenaLog.add("Asleep. Say \"Sena, activate\" to wake me.")
+                }
+            }
+            override fun onInterrupted() { p.flush() }
+            override fun onTool(name: String, args: JSONObject): String = runTool(name, args)
+        }).also { it.start() }
+    }
+
+    private fun runTool(name: String, args: JSONObject): String {
+        val fmt = SimpleDateFormat("EEE h:mm a", Locale.US)
+        return when (name) {
+            "get_current_time" ->
+                SimpleDateFormat("EEEE, MMMM d, yyyy, h:mm a", Locale.US).format(Date()) +
+                    " (" + TimeZone.getDefault().id + ")"
+            "set_alarm" -> {
+                val cal = Calendar.getInstance()
+                cal.set(Calendar.HOUR_OF_DAY, args.optInt("hour", 0).coerceIn(0, 23))
+                cal.set(Calendar.MINUTE, args.optInt("minute", 0).coerceIn(0, 59))
+                cal.set(Calendar.SECOND, 0)
+                cal.set(Calendar.MILLISECOND, 0)
+                if (cal.timeInMillis <= System.currentTimeMillis()) cal.add(Calendar.DAY_OF_MONTH, 1)
+                AlarmReceiver.schedule(this, cal.timeInMillis)
+                val s = "Alarm set for " + fmt.format(Date(cal.timeInMillis))
+                SenaLog.add(s)
+                s
+            }
+            "set_timer" -> {
+                val m = args.optInt("minutes", 0)
+                if (m <= 0) {
+                    "error: minutes must be positive"
+                } else {
+                    val at = System.currentTimeMillis() + m * 60_000L
+                    AlarmReceiver.schedule(this, at)
+                    val s = "Timer set for " + fmt.format(Date(at))
+                    SenaLog.add(s)
+                    s
+                }
+            }
+            "activate_sena" -> {
+                val said = (live?.currentInput() ?: "").lowercase()
+                if (said.isNotBlank() && !(NAME_RE.containsMatchIn(said) && WAKE_RE.containsMatchIn(said))) {
+                    SenaLog.add("(ignored a wake-up I could not confirm: $said)")
+                    "denied: the caller did not say your name with activate. Stay silent."
+                } else {
+                    awake = true
+                    SenaLog.add("Awake.")
+                    "Awake. Greet the caller in one short sentence."
+                }
+            }
+            "go_to_sleep" -> {
+                pendingSleep = true
+                "OK. Say one very short goodbye; after that you are asleep."
+            }
+            "cancel_alarm" -> {
+                AlarmReceiver.cancel(this)
+                SenaLog.add("Alarm off.")
+                "Alarm cancelled."
+            }
+            else -> "error: unknown tool $name"
+        }
     }
 
     private fun applyIntent(res: Gemini.Result) {

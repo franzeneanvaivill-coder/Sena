@@ -11,6 +11,18 @@ object Store {
     fun lang(c: Context): String = prefs(c).getString("lang", "en-US") ?: "en-US"
     fun voiceLock(c: Context): Boolean = prefs(c).getBoolean("voice_lock", false)
 
+    /** Start asleep: she ignores everything until you say "Sena, activate". */
+    fun startAsleep(c: Context): Boolean = prefs(c).getBoolean("start_asleep", true)
+
+    /** Instant mode: stream audio both ways with the Gemini Live API. */
+    fun liveMode(c: Context): Boolean = prefs(c).getBoolean("live_mode", true)
+
+    /** Smarter (slower) brain vs fast brain. */
+    fun smartBrain(c: Context): Boolean = prefs(c).getBoolean("smart_brain", true)
+
+    /** Let Gemini search Google for current facts. */
+    fun webSearch(c: Context): Boolean = prefs(c).getBoolean("web_search", true)
+
     /** 0 = strict, 100 = lenient */
     fun sensitivity(c: Context): Int = prefs(c).getInt("sensitivity", 40)
 

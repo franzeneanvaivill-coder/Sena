@@ -1,28 +1,4 @@
 plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-}
-
-android {
-    namespace = "com.sena.app"
-    compileSdk = 34
-
-    defaultConfig {
-        applicationId = "com.sena.app"
-        minSdk = 26
-        targetSdk = 34
-        versionCode = 2
-        versionName = "2.0-stage2"
-    }
-
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
-    kotlinOptions { jvmTarget = "17" }
-}
-
-dependencies {
-    // WebSocket client for the instant (Live) mode
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    id("com.android.application") version "8.5.2" apply false
+    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
 }

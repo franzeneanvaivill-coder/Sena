@@ -111,6 +111,28 @@ class MainActivity : Activity() {
             )
         })
 
+        col.addView(text("Brain", 20f, true))
+        col.addView(Switch(this).apply {
+            text = "Instant mode (live voice, much faster). Takes effect when you restart Sena."
+            isChecked = Store.liveMode(this@MainActivity)
+            setOnCheckedChangeListener { _, on -> p.edit().putBoolean("live_mode", on).apply() }
+        })
+        col.addView(Switch(this).apply {
+            text = "Start asleep: wake her with \"Sena, activate\". Takes effect when you restart Sena."
+            isChecked = Store.startAsleep(this@MainActivity)
+            setOnCheckedChangeListener { _, on -> p.edit().putBoolean("start_asleep", on).apply() }
+        })
+        col.addView(Switch(this).apply {
+            text = "Smarter brain (understands Bisaya better, a little slower)"
+            isChecked = Store.smartBrain(this@MainActivity)
+            setOnCheckedChangeListener { _, on -> p.edit().putBoolean("smart_brain", on).apply() }
+        })
+        col.addView(Switch(this).apply {
+            text = "Look things up online (news, weather, facts)"
+            isChecked = Store.webSearch(this@MainActivity)
+            setOnCheckedChangeListener { _, on -> p.edit().putBoolean("web_search", on).apply() }
+        })
+
         col.addView(text("Voice lock", 20f, true))
         voiceInfo = text("", 13f)
         col.addView(voiceInfo)
@@ -197,7 +219,7 @@ class MainActivity : Activity() {
         }
         status.text = when {
             enrolling -> "Training your voice..."
-            on -> "Listening."
+            on -> if (SenaService.awake) "Awake. Say \"Sena\" or \"Partner\" before each question." else "Asleep. Say \"Sena, activate\"."
             else -> "Stopped."
         }
         trainBtn.text = if (enrolling) "Cancel training" else if (profile != null) "Retrain my voice" else "Train my voice"

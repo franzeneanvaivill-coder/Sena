@@ -17,7 +17,7 @@ class UtteranceCapture {
         const val RATE = 16000
         const val FRAME = 320            // 20 ms
         private const val PREROLL = 15   // keep 300 ms before speech starts
-        private const val HANG = 35      // 700 ms of silence ends an utterance
+        private const val HANG = 28      // ~560 ms of silence ends an utterance
         private const val MAX_FRAMES = 750 // 15 s hard limit
         private const val MIN_VOICED = 12  // ignore clicks shorter than 240 ms
         private const val CALIB = 25

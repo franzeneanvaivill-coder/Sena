@@ -21,3 +21,8 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
 }
+
+dependencies {
+    // WebSocket client for the instant (Live) mode
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+}

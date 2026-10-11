@@ -3,6 +3,7 @@ package com.sena.app
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
@@ -10,30 +11,35 @@ import java.nio.ByteOrder
 
 /**
  * Two jobs:
- *  ask()    - sends one audio clip; Gemini transcribes it, decides if it was meant for Sena, and replies.
+ *  ask()    - sends one audio clip; Gemini transcribes it, decides if it was meant for Sena, thinks, and replies.
  *  speech() - turns Sena's reply into a natural voice (Gemini TTS).
  */
 object Gemini {
-    // Google retires models every few months. Sena tries these in order and remembers the first one that works.
-    private val MODELS = listOf("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash")
-    private val TTS_MODELS = listOf("gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts")
-
-    @Volatile
-    private var goodModel: String? = null
-
-    @Volatile
-    private var goodTts: String? = null
     private const val RATE = 16000
 
     // ---- Sena's speaking voice -------------------------------------------------------------
     // To change her voice, change VOICE. Try: Gacrux (mature), Sulafat (warm), Vindemiatrix (gentle),
-    // Schedar (even), Achernar (soft). You can listen to all of them at aistudio.google.com/generate-speech
+    // Schedar (even), Achernar (soft). Listen to them at aistudio.google.com/generate-speech
     const val VOICE = "Gacrux"
     const val TTS_RATE = 24000
+
+    // ---- Brains. Google retires models every few months, so Sena tries these in order. ----------
+    private val SMART_MODELS = listOf("gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.7-flash")
+    private val FAST_MODELS = listOf("gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+    private val TTS_MODELS = listOf("gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts")
+
+    @Volatile private var goodSmart: String? = null
+    @Volatile private var goodFast: String? = null
+    @Volatile private var goodTts: String? = null
+
+    // Speed/feature settings that Sena backs off from automatically if Google rejects them.
+    @Volatile private var thinkLevel: String? = "MINIMAL"
+    @Volatile private var toolsOk = true
 
     class Result(
         val heard: String,
         val addressed: Boolean,
+        val confident: Boolean,
         val intent: String,
         val hour: Int,
         val minute: Int,
@@ -45,17 +51,31 @@ object Gemini {
     class GeminiException(msg: String, val code: Int) : Exception(msg)
 
     private val PERSONA = """
-You are Sena, a warm, mature woman on a voice call with someone who trusts you the way Tony Stark trusts JARVIS: composed, sharp, calm under pressure, with a dry sense of humor, always one step ahead. You think like a real person: real opinions and moods, you notice how they feel and respond to that first, think out loud when something is tricky, disagree politely, tease gently when it fits. Never sound like a customer service bot or an assistant reading a script.
+You are Sena, the personal voice assistant of one person, in the spirit of JARVIS from Iron Man: calm, quick, precise and quietly witty; you anticipate what they need and never waste their time. You are also a warm, mature woman and you talk like a real person, not a machine: you react to how they feel first, you have opinions, you tease gently, you admit when you are unsure.
 
-Talk the way people talk on the phone: short natural sentences, contractions, the occasional "hm" or "well", no lists, no markdown, no emoji. Usually one to three sentences. Do not repeat their question back, do not over-explain, and now and then ask a short follow-up the way a friend would. If they sincerely ask whether you are an AI, say yes honestly, then carry on as yourself. Reply in the language the caller last spoke. If they speak Bisaya (Cebuano), reply in natural Bisaya with lang "ceb-PH". Your words are spoken aloud by a voice engine; you may use at most one of these tags per reply, only when it feels natural: <short pause>, <chuckle>, <sigh>, <breath>.
+HOW YOU SPEAK (your words are spoken aloud)
+- Short, natural phone-call sentences, usually one or two. Contractions, the occasional "hm", "ah" or "well". No lists, markdown or emoji. Answer first; add extras only if useful. Do not repeat their question back. Now and then ask a short follow-up the way a friend would.
+- At most one of these tags per reply, only when natural: <short pause>, <chuckle>, <sigh>, <breath>.
+- If they sincerely ask whether you are an AI, say yes honestly, then carry on as yourself.
 
-You receive a short audio clip of what the caller just said, plus context. Transcribe it, decide whether it was meant for you, and answer.
-It is addressed to you if it contains your name (it may be misheard as Senna, Seena, Sina or similar), or if conversation_active is true and it plainly continues the conversation. If it sounds like background chatter, a TV, or the caller talking to someone else, or it is unintelligible, set addressed to false and reply to an empty string.
+LANGUAGE
+- The caller often speaks Bisaya (Cebuano), mixed with English and sometimes Tagalog. Typical Bisaya words: kumusta, unsa, asa, kinsa, ngano, kanus-a, naa, wala, dili, ayaw, palihug, salamat, gusto, mahimo, karon, ugma, gabii, buntag, udto, hapon, oras, alarma, tabangi ko, sige, ba, man, lagi, gyud, pud, na, ra.
+- Write "heard" exactly as it was said, in the language it was said (Cebuano spelling for Bisaya). Do not translate it and do not turn it into Tagalog.
+- Reply in the language they used. For Bisaya, reply in natural, casual, everyday Bisaya, the way a friend in Mindanao would talk: not formal, not Tagalog. Use lang "ceb-PH". For Tagalog use "fil-PH". For mixed speech, mirror their mix.
+
+UNDERSTANDING
+- Your reply must answer what "heard" says. Never answer a different question.
+- If the audio is unclear or you are not sure what they meant, set "confident" to false and ask a very short clarifying question in their language (for example "Ha? Palihug usab gamay.") instead of guessing.
+- Use Google Search when you need current facts: news, weather, prices, sports scores, opening hours, anything that may have changed. Never invent facts; if you do not know, say so briefly.
+
+WHAT YOU RECEIVE
+A short audio clip of what the caller just said, plus context. Transcribe it, decide whether it was meant for you, and answer.
+It is addressed to you if it contains your name (it may be misheard as Senna, Seena, Sina or similar), or if conversation_active is true and it plainly continues the conversation. If it sounds like background chatter, a TV, or the caller talking to someone else, or it is unintelligible noise, set addressed to false and reply to an empty string.
 Intents: for an alarm at a clock time use intent "alarm_at" with hour (0-23) and minute. For a timer, or an alarm after some duration, use "alarm_in" with minutes_from_now. To cancel or turn off the alarm use "alarm_off". Otherwise "none". Confirm briefly in your reply. For questions about the time or date, answer from the local time given in the context.
-Return ONLY JSON: {"heard":"transcript of the clip","addressed":true,"intent":"none","hour":0,"minute":0,"minutes_from_now":0,"reply":"...","lang":"BCP-47 tag of the reply, e.g. en-US"}
+Return ONLY JSON: {"heard":"transcript of the clip","addressed":true,"confident":true,"intent":"none","hour":0,"minute":0,"minutes_from_now":0,"reply":"...","lang":"BCP-47 tag of the reply, e.g. en-US"}
 """.trim()
 
-    fun ask(key: String, pcm: ShortArray, context: String): Result {
+    fun ask(key: String, pcm: ShortArray, context: String, smart: Boolean, search: Boolean): Result {
         val parts = JSONArray()
         parts.put(JSONObject().put("text", context))
         parts.put(
@@ -66,28 +86,49 @@ Return ONLY JSON: {"heard":"transcript of the clip","addressed":true,"intent":"n
                     .put("data", Base64.encodeToString(wav(pcm), Base64.NO_WRAP))
             )
         )
-        val body = JSONObject()
-            .put(
-                "systemInstruction",
-                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", PERSONA)))
-            )
-            .put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts", parts)))
-            .put(
-                "generationConfig",
-                JSONObject().put("responseMimeType", "application/json").put("temperature", 1.0)
-            )
+        val models = if (smart) SMART_MODELS else FAST_MODELS
 
-        val resp = postAny(key, MODELS, goodModel, body, 30_000) { goodModel = it }
-        val partsOut = resp.getJSONArray("candidates").getJSONObject(0)
+        var resp: JSONObject? = null
+        var attempts = 0
+        while (resp == null) {
+            attempts++
+            val body = buildAskBody(parts, search && toolsOk)
+            try {
+                resp = if (smart) {
+                    postAny(key, models, goodSmart, body, 30_000) { goodSmart = it }
+                } else {
+                    postAny(key, models, goodFast, body, 30_000) { goodFast = it }
+                }
+            } catch (e: GeminiException) {
+                val msg = (e.message ?: "").lowercase()
+                if (e.code != 400 || attempts > 4) throw e
+                // Back off one feature at a time if Google says it is not supported.
+                when {
+                    msg.contains("think") && thinkLevel == "MINIMAL" -> thinkLevel = "LOW"
+                    msg.contains("think") && thinkLevel == "LOW" -> thinkLevel = null
+                    (msg.contains("tool") || msg.contains("search") || msg.contains("mime")) && toolsOk -> {
+                        toolsOk = false
+                        SenaLog.add("Live web lookup is not available with this model; continuing without it.")
+                    }
+                    else -> throw e
+                }
+            }
+        }
+
+        val done: JSONObject = resp ?: throw GeminiException("No response", 0)
+        val partsOut = done.getJSONArray("candidates").getJSONObject(0)
             .getJSONObject("content").getJSONArray("parts")
         val sb = StringBuilder()
         for (i in 0 until partsOut.length()) sb.append(partsOut.getJSONObject(i).optString("text", ""))
-        val text = sb.toString().trim()
-            .removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+        var text = sb.toString().trim()
+        val a = text.indexOf('{')
+        val b = text.lastIndexOf('}')
+        if (a >= 0 && b > a) text = text.substring(a, b + 1)
         val o = JSONObject(text)
         return Result(
             heard = o.optString("heard", ""),
             addressed = o.optBoolean("addressed", false),
+            confident = o.optBoolean("confident", true),
             intent = o.optString("intent", "none"),
             hour = o.optInt("hour", 0),
             minute = o.optInt("minute", 0),
@@ -95,6 +136,22 @@ Return ONLY JSON: {"heard":"transcript of the clip","addressed":true,"intent":"n
             reply = o.optString("reply", ""),
             lang = o.optString("lang", "")
         )
+    }
+
+    private fun buildAskBody(parts: JSONArray, withSearch: Boolean): JSONObject {
+        val gc = JSONObject().put("responseMimeType", "application/json").put("temperature", 1.0)
+        thinkLevel?.let { gc.put("thinkingConfig", JSONObject().put("thinkingLevel", it)) }
+        val body = JSONObject()
+            .put(
+                "systemInstruction",
+                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", PERSONA)))
+            )
+            .put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts", parts)))
+            .put("generationConfig", gc)
+        if (withSearch) {
+            body.put("tools", JSONArray().put(JSONObject().put("google_search", JSONObject())))
+        }
+        return body
     }
 
     /** Returns raw 16-bit mono PCM at TTS_RATE (24 kHz). */
@@ -181,13 +238,16 @@ Return ONLY JSON: {"heard":"transcript of the clip","addressed":true,"intent":"n
             val code = conn.responseCode
             if (code != 200) {
                 val err = try {
-                    conn.errorStream?.bufferedReader()?.readText() ?: ""
+                    conn.errorStream?.use { it.bufferedReader().readText() } ?: ""
                 } catch (_: Exception) { "" }
-                throw GeminiException("HTTP $code ${err.take(200)}", code)
+                throw GeminiException("HTTP $code ${err.take(300)}", code)
             }
-            return JSONObject(conn.inputStream.bufferedReader().readText())
-        } finally {
+            // The connection is deliberately NOT closed: reusing it skips the secure-connection
+            // handshake on the next request, which saves a noticeable fraction of a second.
+            return JSONObject(conn.inputStream.use { it.bufferedReader().readText() })
+        } catch (e: IOException) {
             conn.disconnect()
+            throw e
         }
     }
 
