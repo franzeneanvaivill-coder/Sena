@@ -43,3 +43,32 @@ open the Actions tab, run "Build APK", and download the Sena-apk artifact. The f
   spoken sentence by sentence so she starts talking sooner.
 - The voice service counts against your Gemini quota. If her voice suddenly goes robotic, the Activity log will show a "Voice error" line.
 - Still not possible: interrupting her while she talks.
+
+## Stage 4 update: faster, sharper, more like JARVIS
+- **Brain switch (main screen):** "Smarter brain" uses Gemini 3.5 Flash, which understands Bisaya much better than the
+  lite model. Turn it off for the fastest (but less accurate) replies.
+- **Look things up online:** she can search Google for news, weather, scores and other current facts.
+- **Speed:** the model's "thinking" time is cut to the minimum, the connection to Google is reused between questions,
+  and she decides you have finished speaking about 140 ms sooner.
+- **Bisaya:** the instructions now teach her to write down exactly what you said in Bisaya, answer in casual Bisaya,
+  and ask you to repeat when she is not sure instead of guessing. The activity log shows what she thought you said
+  ("You: ...") so you can see where she misheard.
+
+## Stage 5 update: instant mode (Gemini Live)
+- New switch on the main screen: **Instant mode**. Sena now keeps a live connection to Google. When you finish speaking and
+  your voice passes the check, your sentence is sent and her voice starts streaming back while she is still thinking:
+  no separate "make her voice" request, no waiting for the whole answer.
+- Alarms, timers and "what time is it" now work through live tools; she can still search Google for current facts.
+- The activity log shows how fast it was: `Reply started 900 ms after you finished.`
+- If the live connection fails for any reason, she falls back to the classic method automatically and the log says why.
+- Limits: she cannot be interrupted yet (while she talks she ignores new sounds, which also keeps her from hearing herself).
+  The live service is a preview and its usage cost is higher than the classic mode; check Google's pricing page.
+
+## Stage 6 update: "Sena, activate"
+- Sena starts **asleep**. She ignores everything until she hears **"Sena, activate"** (or "Partner, activate") in your trained voice.
+- Once awake she answers only when she hears **"Sena"** or **"Partner"** in that sentence, every time. No follow-ups without her name.
+- **"Sena, deactivate"** or **"Sena, go to sleep"** puts her back to sleep.
+- The main screen shows whether she is asleep or awake. A switch lets you turn "start asleep" off.
+- Keep **Only obey my voice** on, otherwise anyone can wake her.
+- While asleep she still listens, because she has to catch "activate". Sentences in your voice are still sent to Google for that
+  (the phone cannot recognize a wake word by itself). Stop Sena from the notification if you want the mic fully off.
